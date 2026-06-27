@@ -213,6 +213,9 @@ with st.sidebar:
 if "scenario_df" not in st.session_state:
     st.session_state.scenario_df = make_sample_data().copy()
 
+if "drilldown" not in st.session_state:
+    st.session_state.drilldown = None
+
 if use_demo:
     if scenario_mode:
         df_display = None   # will be set after scenario controls
@@ -334,19 +337,136 @@ critical_count = int((df["Days to Expiry"] < 30).sum()) if "Days to Expiry" in d
 reorder_count = int(df["Reorder Needed"].sum()) if "Reorder Needed" in df.columns else 0
 
 k1.metric("Total SKUs Managed", total_skus)
+if k1.button("🔍 Breakdown by Category", key="dd_skus", use_container_width=True):
+    st.session_state.drilldown = None if st.session_state.drilldown == "total_skus" else "total_skus"
+
 k2.metric("Total Units in Facility", f"{total_units:,}")
+if k2.button("🔍 Units by Category", key="dd_units", use_container_width=True):
+    st.session_state.drilldown = None if st.session_state.drilldown == "total_units" else "total_units"
+
 k3.metric(
     "Expiring in < 30 Days",
     critical_count,
     delta=f"{critical_count} need action" if critical_count else "All clear",
     delta_color="inverse",
 )
+if k3.button(
+    f"🔍 View {critical_count} SKUs" if critical_count else "✅ None expiring",
+    key="dd_expiry",
+    use_container_width=True,
+    disabled=(critical_count == 0),
+):
+    st.session_state.drilldown = None if st.session_state.drilldown == "expiry" else "expiry"
+
 k4.metric(
     "Below Reorder Point",
     reorder_count,
     delta=f"{reorder_count} SKUs" if reorder_count else "All stocked",
     delta_color="inverse",
 )
+if k4.button(
+    f"🔍 View {reorder_count} SKUs" if reorder_count else "✅ All stocked",
+    key="dd_reorder",
+    use_container_width=True,
+    disabled=(reorder_count == 0),
+):
+    st.session_state.drilldown = None if st.session_state.drilldown == "reorder" else "reorder"
+
+# ─── KPI Drilldown Panel ──────────────────────────────────────────────────────
+if st.session_state.drilldown:
+    with st.container(border=True):
+        title_col, close_col = st.columns([11, 1])
+
+        if st.session_state.drilldown == "total_skus":
+            title_col.markdown("#### 📊 SKU Breakdown by Category & ABC Class")
+            if close_col.button("✕", key="close_dd"):
+                st.session_state.drilldown = None
+            else:
+                breakdown = (
+                    df.groupby(["Category", "ABC Class"], observed=True)
+                    .size()
+                    .reset_index(name="SKU Count")
+                    .pivot(index="Category", columns="ABC Class", values="SKU Count")
+                    .fillna(0)
+                    .astype(int)
+                    .reset_index()
+                )
+                breakdown["Total"] = breakdown[[c for c in ["A", "B", "C"] if c in breakdown.columns]].sum(axis=1)
+                breakdown["% of Portfolio"] = (breakdown["Total"] / total_skus * 100).round(1).astype(str) + "%"
+                st.dataframe(breakdown, hide_index=True, use_container_width=True)
+
+        elif st.session_state.drilldown == "total_units":
+            title_col.markdown("#### 📦 Units in Facility by Category")
+            if close_col.button("✕", key="close_dd"):
+                st.session_state.drilldown = None
+            else:
+                units_by_cat = (
+                    df.groupby("Category")["Stock on Hand"]
+                    .sum()
+                    .reset_index(name="Total Units")
+                    .sort_values("Total Units", ascending=False)
+                )
+                units_by_cat["% of Total"] = (units_by_cat["Total Units"] / total_units * 100).round(1).astype(str) + "%"
+                chart_col, table_col = st.columns([3, 2])
+                with chart_col:
+                    fig_u = px.bar(
+                        units_by_cat, x="Total Units", y="Category",
+                        orientation="h", text="Total Units",
+                        color="Total Units", color_continuous_scale="Blues",
+                    )
+                    fig_u.update_traces(textposition="outside")
+                    fig_u.update_layout(height=260, margin=dict(t=5, b=5), showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(fig_u, use_container_width=True)
+                with table_col:
+                    st.dataframe(units_by_cat, hide_index=True, use_container_width=True, height=260)
+
+        elif st.session_state.drilldown == "expiry":
+            title_col.markdown(f"#### 🔴 {critical_count} SKU(s) Expiring in < 30 Days")
+            if close_col.button("✕", key="close_dd"):
+                st.session_state.drilldown = None
+            else:
+                exp_df = df[df["Days to Expiry"] < 30].sort_values("Days to Expiry").copy()
+                if not exp_df.empty:
+                    exp_df["Urgency"] = exp_df["Days to Expiry"].apply(
+                        lambda d: "🚨 Critical (<7d)" if d < 7 else ("⚠️ Urgent (7–14d)" if d < 14 else "❗ Soon (14–30d)")
+                    )
+                    show = [c for c in ["SKU", "Product Name", "Category", "Days to Expiry",
+                                        "Expiry Date", "Stock on Hand", "Stock Value (AED)", "Supplier", "Urgency"]
+                            if c in exp_df.columns]
+                    st.dataframe(
+                        exp_df[show].style.background_gradient(subset=["Days to Expiry"], cmap="RdYlGn"),
+                        hide_index=True, use_container_width=True,
+                    )
+                    st.caption(f"Total stock value at risk: **AED {exp_df['Stock Value (AED)'].sum():,.0f}**")
+                else:
+                    st.success("No SKUs in the critical expiry window.")
+
+        elif st.session_state.drilldown == "reorder":
+            title_col.markdown(f"#### 📦 {reorder_count} SKU(s) Below Reorder Point")
+            if close_col.button("✕", key="close_dd"):
+                st.session_state.drilldown = None
+            else:
+                ro_df = df[df["Reorder Needed"]].copy()
+                if not ro_df.empty:
+                    ro_df["Shortfall"] = (ro_df["Reorder Point"] - ro_df["Stock on Hand"]).clip(lower=0)
+                    ro_df["Suggested Order Qty"] = (ro_df["Reorder Point"] * 1.5 - ro_df["Stock on Hand"]).clip(lower=0).astype(int)
+                    ro_df["Coverage %"] = (ro_df["Stock on Hand"] / ro_df["Reorder Point"] * 100).round(1)
+                    show = [c for c in ["SKU", "Product Name", "ABC Class", "Stock on Hand",
+                                        "Reorder Point", "Shortfall", "Coverage %", "Suggested Order Qty", "Supplier"]
+                            if c in ro_df.columns]
+                    st.dataframe(
+                        ro_df[show].sort_values("Shortfall", ascending=False)
+                        .style.background_gradient(subset=["Coverage %"], cmap="RdYlGn"),
+                        hide_index=True, use_container_width=True,
+                    )
+                    st.caption(
+                        f"Sorted by largest shortfall first · "
+                        f"A-class gaps: {int((ro_df['ABC Class'] == 'A').sum())} · "
+                        f"B-class: {int((ro_df['ABC Class'] == 'B').sum())} · "
+                        f"C-class: {int((ro_df['ABC Class'] == 'C').sum())}"
+                    )
+                else:
+                    st.success("All SKUs are adequately stocked.")
 
 st.divider()
 
